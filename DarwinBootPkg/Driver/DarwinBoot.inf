@@ -10,6 +10,7 @@
 [Sources]
   DarwinBoot.c
   PackedRamdisk.h
+  MemoryMapDiag.h
   BootArgs.h
   BootVideo.h
   DiagFont.h
@@ -25,6 +26,7 @@
   DebugLib
   MemoryAllocationLib
   PrintLib
+  SerialPortLib
   UefiBootServicesTableLib
   UefiDriverEntryPoint
   UefiLib

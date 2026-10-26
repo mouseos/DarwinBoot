@@ -7,6 +7,7 @@
 #include <Library/MemoryAllocationLib.h>
 #include <Library/UefiBootServicesTableLib.h>
 #include <Library/PrintLib.h>
+#include <Library/SerialPortLib.h>
 #include <Library/UefiLib.h>
 #include <Protocol/UniXNULoader.h>
 #include <Protocol/LoadedImage.h>
@@ -16,6 +17,7 @@
 #include "BootVideo.h"
 #include "PackedRamdisk.h"
 #include "WindowSize.h"
+#include "MemoryMapDiag.h"
 
 #define WINDOW_SIZE  SIZE_256MB
 #define BLOCK_SIZE   SIZE_2MB
@@ -421,6 +423,7 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
   BestBytes = 0;
   Status = GetMap (&Map, &Capacity, &Size, &Key, &Stride);
   if (EFI_ERROR (Status)) { if (Map != NULL) { FreePool (Map); } return Status; }
+  DarwinDumpMemoryMap (0, Map, Size, Stride);
   Status = EFI_OUT_OF_RESOURCES;
   for (Offset = 0; Offset + Stride <= Size; Offset += Stride) {
     Descriptor = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Offset);
@@ -688,6 +691,7 @@ Boot (
       if (Attempt == 0) { goto Fail; }
       CpuDeadLoop ();
     }
+    DarwinDumpMemoryMap (1, Map, MapSize, Stride);
     Status = gBS->ExitBootServices (mImage, Key);
     if (!EFI_ERROR (Status)) {
       DarwinEnter (ArgsAddress, Address + Kernel.Entry - Kernel.Base, Address, WindowSize, Video[0], Video[2] * Video[4]);
