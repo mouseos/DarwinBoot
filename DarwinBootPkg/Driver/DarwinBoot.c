@@ -14,6 +14,9 @@
 #include <Protocol/GraphicsOutput.h>
 #include <Protocol/SimpleFileSystem.h>
 #include "BootArgs.h"
+#if DARWINBOOT_BOARD_HANDOFF
+#include "BoardHandoff.h"
+#endif
 #include "BootVideo.h"
 #include "PackedRamdisk.h"
 #include "WindowSize.h"
@@ -40,6 +43,9 @@ typedef struct {
 } KERNEL;
 
 STATIC EFI_HANDLE  mImage;
+#if DARWINBOOT_BOARD_HANDOFF
+STATIC DARWIN_BOOT_BOARD_HANDOFF *mBoardHook;
+#endif
 UINT64 EFIAPI DarwinCurrentEl (VOID);
 VOID EFIAPI DarwinEnter (UINT64 Args, UINT64 Entry, UINT64 Memory, UINT64 Size, UINT64 VideoBase, UINT64 VideoBytes);
 
@@ -684,6 +690,20 @@ Boot (
           READ_SYSREG (id_aa64mmfr0_el1) & 0xF, (((READ_SYSREG (id_aa64mmfr0_el1) >> 28) & 0xF) == 0xF) ? "NOT supported" : "supported"));
   DEBUG ((DEBUG_ERROR, "ID_AA64PFR0_EL1  0x%lx\n", READ_SYSREG (id_aa64pfr0_el1)));
   DEBUG ((DEBUG_ERROR, "\nExiting boot services. A green bar across the top\nmeans the kernel entry code ran.\n"));
+#if DARWINBOOT_BOARD_HANDOFF
+  // No charger policy or board layout in the generic loader. Default OFF.
+  {
+    EFI_GUID Guid = DARWIN_BOOT_BOARD_HANDOFF_GUID;
+    DARWIN_BOOT_BOARD_HANDOFF *Hook = NULL;
+    Status = gBS->LocateProtocol (&Guid, NULL, (VOID **)&Hook);
+    if (EFI_ERROR (Status) || Hook == NULL || Hook->Version != 1 || Hook->AttachTree == NULL) {
+      Status = EFI_UNSUPPORTED; goto Fail;
+    }
+    Status = Hook->AttachTree ((VOID *)(UINTN)TreeAddress, TreeSize);
+    if (EFI_ERROR (Status)) { goto Fail; }
+    mBoardHook = Hook;
+  }
+#endif
   for (Attempt = 0; Attempt < 3; Attempt++) {
     MapSize = Capacity;
     Status = gBS->GetMemoryMap (&MapSize, Map, &Key, &Stride, &Version);
@@ -702,6 +722,9 @@ Boot (
   CpuDeadLoop ();
   return EFI_ABORTED;
 Fail:
+#if DARWINBOOT_BOARD_HANDOFF
+  if (mBoardHook != NULL) { mBoardHook->AttachTree (NULL, 0); mBoardHook = NULL; }
+#endif
   if (Root != NULL) { Root->Close (Root); }
   if (Image != NULL) { FreePool (Image); }
   if (Tree != NULL) { FreePool (Tree); }
