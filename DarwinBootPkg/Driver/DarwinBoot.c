@@ -45,6 +45,11 @@ typedef struct {
 STATIC EFI_HANDLE  mImage;
 #if DARWINBOOT_BOARD_HANDOFF
 STATIC DARWIN_BOOT_BOARD_HANDOFF *mBoardHook;
+// /chosen/darwinboot-memory-floor (8 bytes, optional, absent = off): extend the memory handed to XNU below the window down to
+// this physical address. XNU keeps the window's kernel where it is and returns the range from its physical base up to the
+// kernel to the VM at start (arm_vm_init: ml_static_mfree(gPhysBase, segLOWEST - gVirtBase)). Used only if every page of the
+// range is memory the OS owns after ExitBootServices in the final memory map; otherwise the boot goes on without it.
+STATIC UINT64 mMemoryFloor;
 #endif
 UINT64 EFIAPI DarwinCurrentEl (VOID);
 VOID EFIAPI DarwinEnter (UINT64 Args, UINT64 Entry, UINT64 Memory, UINT64 Size, UINT64 VideoBase, UINT64 VideoBytes);
@@ -202,6 +207,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   UINTN  TrustCandidate;
   UINTN  AddonCandidate;
   UINTN  MemoryCandidate;
+  UINTN  FloorCandidate;
   CONST UINT8 *Name;
   UINTN  NameLength;
 
@@ -211,6 +217,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   TrustCandidate = MAX_UINTN;
   AddonCandidate = MAX_UINTN;
   MemoryCandidate = MAX_UINTN;
+  FloorCandidate = MAX_UINTN;
   if ((Depth > 64) || (Size - *Offset < 8)) { return FALSE; }
   Properties = U32 (Data + *Offset);
   Children = U32 (Data + *Offset + 4);
@@ -248,6 +255,10 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
       if ((MemoryCandidate != MAX_UINTN) || (Length != 8)) { return FALSE; }
       MemoryCandidate = *Offset;
     }
+    if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "darwinboot-memory-floor") == 0) {
+      if ((FloorCandidate != MAX_UINTN) || (Length != 8)) { return FALSE; }
+      FloorCandidate = *Offset;
+    }
     *Offset += Length;
     if (ALIGN_VALUE (*Offset, 4) > Size) { return FALSE; }
     *Offset = ALIGN_VALUE (*Offset, 4);
@@ -272,6 +283,11 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
     if ((Path != 1) || (*WindowSize != 0)) { return FALSE; }
     *WindowSize = U64 (Data + MemoryCandidate);
     if (!DarwinWindowSizeValid (*WindowSize)) { return FALSE; }
+  }
+  if (FloorCandidate != MAX_UINTN) {
+    if ((Path != 1) || (mMemoryFloor != 0)) { return FALSE; }
+    mMemoryFloor = U64 (Data + FloorCandidate);
+    if ((mMemoryFloor == 0) || (mMemoryFloor & EFI_PAGE_MASK)) { return FALSE; }
   }
   if (Children > (Size - *Offset) / 8) { return FALSE; }
   for (Index = 0; Index < Children; Index++) {
@@ -402,6 +418,56 @@ DiagDraw (CONST CHAR16 *Text, UINTN Row)
     }
     X += Cell;
   }
+}
+
+// True when [Floor, Top) is wholly covered by descriptors of memory the OS owns after ExitBootServices. No allocation:
+// this runs between the final GetMemoryMap and ExitBootServices.
+STATIC
+BOOLEAN
+FloorReclaimable (CONST VOID *Map, UINTN Size, UINTN Stride, UINT64 Floor, UINT64 Top, UINT64 *BadAddress, UINT32 *BadType)
+{
+  UINT64                      Cursor;
+  UINTN                       Offset;
+  BOOLEAN                     Found;
+  CONST EFI_MEMORY_DESCRIPTOR *Descriptor;
+
+  Cursor = Floor;
+  while (Cursor < Top) {
+    Found = FALSE;
+    for (Offset = 0; Offset + Stride <= Size; Offset += Stride) {
+      Descriptor = (CONST EFI_MEMORY_DESCRIPTOR *)((CONST UINT8 *)Map + Offset);
+      if ((Descriptor->PhysicalStart <= Cursor) &&
+          (Cursor < Descriptor->PhysicalStart + EFI_PAGES_TO_SIZE (Descriptor->NumberOfPages))) {
+        switch (Descriptor->Type) {
+          case EfiConventionalMemory:
+          case EfiBootServicesCode:
+          case EfiBootServicesData:
+          case EfiLoaderCode:
+          case EfiLoaderData:
+            break;
+          default:
+            *BadAddress = Cursor; *BadType = Descriptor->Type;
+            return FALSE;
+        }
+        Cursor = Descriptor->PhysicalStart + EFI_PAGES_TO_SIZE (Descriptor->NumberOfPages);
+        Found = TRUE;
+        break;
+      }
+    }
+    if (!Found) { *BadAddress = Cursor; *BadType = MAX_UINT32; return FALSE; }
+  }
+  return TRUE;
+}
+
+STATIC
+VOID
+FloorReport (CONST CHAR8 *Format, UINT64 A, UINT64 B, UINT64 C)
+{
+  CHAR8 Line[160];
+  UINTN Length;
+
+  Length = AsciiSPrint (Line, sizeof (Line), Format, A, B, C);
+  SerialPortWrite ((UINT8 *)Line, Length);
 }
 
 STATIC
@@ -559,6 +625,7 @@ Boot (
   if (EFI_ERROR (Status)) { goto Fail; }
   Offset = 0;
   RamdiskOffset = MAX_UINTN;
+  mMemoryFloor = 0;
   TrustCacheOffset = MAX_UINTN;
   AddonOffset = MAX_UINTN;
   WindowSize = 0;
@@ -712,6 +779,24 @@ Boot (
       CpuDeadLoop ();
     }
     DarwinDumpMemoryMap (1, Map, MapSize, Stride);
+    Args->PhysicalBase = Address;
+    Args->VirtualBase = Kernel.Base;
+    Args->MemorySize = WindowSize;
+    Args->MemorySizeActual = WindowSize;
+    if (mMemoryFloor != 0) {
+      UINT64 BadAddress = 0;
+      UINT32 BadType = 0;
+      if ((mMemoryFloor < Address) && (Address - mMemoryFloor <= SIZE_2GB) &&
+          FloorReclaimable (Map, MapSize, Stride, mMemoryFloor, Address, &BadAddress, &BadType)) {
+        Args->PhysicalBase = mMemoryFloor;
+        Args->VirtualBase = Kernel.Base - (Address - mMemoryFloor);
+        Args->MemorySize = WindowSize + (Address - mMemoryFloor);
+        Args->MemorySizeActual = Args->MemorySize;
+        FloorReport ("DARWINBOOT: memory floor 0x%lx accepted, below window 0x%lx, total 0x%lx\r\n", mMemoryFloor, Address - mMemoryFloor, Args->MemorySize);
+      } else {
+        FloorReport ("DARWINBOOT: memory floor 0x%lx refused at 0x%lx type %lu; window only\r\n", mMemoryFloor, BadAddress, BadType);
+      }
+    }
     Status = gBS->ExitBootServices (mImage, Key);
     if (!EFI_ERROR (Status)) {
       DarwinEnter (ArgsAddress, Address + Kernel.Entry - Kernel.Base, Address, WindowSize, Video[0], Video[2] * Video[4]);
