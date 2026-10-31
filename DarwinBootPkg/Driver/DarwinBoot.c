@@ -50,6 +50,10 @@ STATIC DARWIN_BOOT_BOARD_HANDOFF *mBoardHook;
 // kernel to the VM at start (arm_vm_init: ml_static_mfree(gPhysBase, segLOWEST - gVirtBase)). Used only if every page of the
 // range is memory the OS owns after ExitBootServices in the final memory map; otherwise the boot goes on without it.
 STATIC UINT64 mMemoryFloor;
+// XNU arm64 (no ARM_LARGE_MEMORY, 4 KiB pages) maps its static region from gVirtBase rounded down to 8 MiB and reserves the
+// low globals at 0xFFFFFFF000000000 (8 MiB) beside it (pmap_virtual_region, kmem_init); the static region must start above
+// them or kmem_init panics. The floor is a lower bound: it is raised so that VirtualBase stays at or above this address.
+#define DARWIN_XNU_STATIC_VA_FLOOR  0xFFFFFFF000800000ULL
 #endif
 UINT64 EFIAPI DarwinCurrentEl (VOID);
 VOID EFIAPI DarwinEnter (UINT64 Args, UINT64 Entry, UINT64 Memory, UINT64 Size, UINT64 VideoBase, UINT64 VideoBytes);
@@ -786,6 +790,12 @@ Boot (
     if (mMemoryFloor != 0) {
       UINT64 BadAddress = 0;
       UINT32 BadType = 0;
+      UINT64 Requested = mMemoryFloor;
+      UINT64 Room = (Kernel.Base > DARWIN_XNU_STATIC_VA_FLOOR) ? Kernel.Base - DARWIN_XNU_STATIC_VA_FLOOR : 0;
+      if ((mMemoryFloor < Address) && (Address - mMemoryFloor > Room)) {
+        mMemoryFloor = (Room >= Address) ? Address : ALIGN_VALUE (Address - Room, EFI_PAGE_SIZE);
+        FloorReport ("DARWINBOOT: memory floor 0x%lx raised to 0x%lx (kernel va 0x%lx)\r\n", Requested, mMemoryFloor, Kernel.Base);
+      }
       if ((mMemoryFloor < Address) && (Address - mMemoryFloor <= SIZE_2GB) &&
           FloorReclaimable (Map, MapSize, Stride, mMemoryFloor, Address, &BadAddress, &BadType)) {
         Args->PhysicalBase = mMemoryFloor;
