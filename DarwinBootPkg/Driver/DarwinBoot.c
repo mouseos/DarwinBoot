@@ -40,6 +40,8 @@ typedef struct {
   UINT64   Base;
   UINT64   End;
   UINT64   Entry;
+  // The lowest address the kernel's static region (VirtualBase) may start at: above XNU's low globals and their reservation.
+  UINT64   StaticVaFloor;
 } KERNEL;
 
 STATIC EFI_HANDLE  mImage;
@@ -53,7 +55,10 @@ STATIC UINT64 mMemoryFloor;
 // XNU arm64 (no ARM_LARGE_MEMORY, 4 KiB pages) maps its static region from gVirtBase rounded down to 8 MiB and reserves the
 // low globals at 0xFFFFFFF000000000 (8 MiB) beside it (pmap_virtual_region, kmem_init); the static region must start above
 // them or kmem_init panics. The floor is a lower bound: it is raised so that VirtualBase stays at or above this address.
+// A kernel built with the low globals moved (UniXNU patches/xnu zzzzz-low-globals-below.patch, XNU_LOW_GLOBALS_BELOW) records
+// their address in its __DATA_CONST,__lowglo_base section; the limit is then that address plus the same 8 MiB.
 #define DARWIN_XNU_STATIC_VA_FLOOR  0xFFFFFFF000800000ULL
+#define DARWIN_XNU_LOW_GLOBALS_SIZE SIZE_8MB
 #endif
 UINT64 EFIAPI DarwinCurrentEl (VOID);
 VOID EFIAPI DarwinEnter (UINT64 Args, UINT64 Entry, UINT64 Memory, UINT64 Size, UINT64 VideoBase, UINT64 VideoBytes);
@@ -147,6 +152,9 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
   }
   if (U32 (Data + 20) > Size - 32) { return EFI_LOAD_ERROR; }
   ZeroMem (Kernel, sizeof (*Kernel));
+#if DARWINBOOT_BOARD_HANDOFF
+  Kernel->StaticVaFloor = DARWIN_XNU_STATIC_VA_FLOOR;
+#endif
   Count = U32 (Data + 16);
   End = 32 + U32 (Data + 20);
   Offset = 32;
@@ -159,6 +167,22 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
     if (Command == 0x19) {
       if ((Length < 72) || (U32 (Data + Offset + 64) > (Length - 72) / 80) ||
           (Kernel->Count == MAX_SEGMENTS)) { return EFI_LOAD_ERROR; }
+#if DARWINBOOT_BOARD_HANDOFF
+      if (CompareMem (Data + Offset + 8, "__DATA_CONST\0\0\0\0", 16) == 0) {
+        UINT32  Section;
+        for (Section = 0; Section < U32 (Data + Offset + 64); Section++) {
+          CONST UINT8  *Header = Data + Offset + 72 + Section * 80;
+          UINT64       Value;
+          if ((CompareMem (Header, "__lowglo_base\0\0\0", 16) != 0) || (U64 (Header + 40) != 8) ||
+              (U32 (Header + 48) > Size - 8)) { continue; }
+          Value = U64 (Data + U32 (Header + 48));
+          // Only a lower, 8 MiB aligned address can relax the limit; anything else keeps the default.
+          if (((Value & (DARWIN_XNU_LOW_GLOBALS_SIZE - 1)) == 0) && (Value + DARWIN_XNU_LOW_GLOBALS_SIZE < DARWIN_XNU_STATIC_VA_FLOOR)) {
+            Kernel->StaticVaFloor = Value + DARWIN_XNU_LOW_GLOBALS_SIZE;
+          }
+        }
+      }
+#endif
       if (U64 (Data + Offset + 32) != 0) {
         Segment = &Kernel->Segments[Kernel->Count++];
         Segment->Address = U64 (Data + Offset + 24);
@@ -791,7 +815,11 @@ Boot (
       UINT64 BadAddress = 0;
       UINT32 BadType = 0;
       UINT64 Requested = mMemoryFloor;
-      UINT64 Room = (Kernel.Base > DARWIN_XNU_STATIC_VA_FLOOR) ? Kernel.Base - DARWIN_XNU_STATIC_VA_FLOOR : 0;
+      UINT64 Room = (Kernel.Base > Kernel.StaticVaFloor) ? Kernel.Base - Kernel.StaticVaFloor : 0;
+      if (Kernel.StaticVaFloor != DARWIN_XNU_STATIC_VA_FLOOR) {
+        FloorReport ("DARWINBOOT: kernel low globals at 0x%lx; static region floor 0x%lx (kernel va 0x%lx)\r\n",
+                     Kernel.StaticVaFloor - DARWIN_XNU_LOW_GLOBALS_SIZE, Kernel.StaticVaFloor, Kernel.Base);
+      }
       if ((mMemoryFloor < Address) && (Address - mMemoryFloor > Room)) {
         mMemoryFloor = (Room >= Address) ? Address : ALIGN_VALUE (Address - Room, EFI_PAGE_SIZE);
         FloorReport ("DARWINBOOT: memory floor 0x%lx raised to 0x%lx (kernel va 0x%lx)\r\n", Requested, mMemoryFloor, Kernel.Base);
