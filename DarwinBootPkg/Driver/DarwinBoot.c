@@ -59,6 +59,8 @@ STATIC UINT64 mMemoryFloor;
 // their address in its __DATA_CONST,__lowglo_base section; the limit is then that address plus the same 8 MiB.
 #define DARWIN_XNU_STATIC_VA_FLOOR  0xFFFFFFF000800000ULL
 #define DARWIN_XNU_LOW_GLOBALS_SIZE SIZE_8MB
+// XNU arm64 VM_MIN_KERNEL_ADDRESS without ARM_LARGE_MEMORY (4 KiB pages): a recorded low globals address must lie above it.
+#define DARWIN_XNU_MIN_KERNEL_VA    0xFFFFFFE000000000ULL
 #endif
 UINT64 EFIAPI DarwinCurrentEl (VOID);
 VOID EFIAPI DarwinEnter (UINT64 Args, UINT64 Entry, UINT64 Memory, UINT64 Size, UINT64 VideoBase, UINT64 VideoBytes);
@@ -170,14 +172,27 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
 #if DARWINBOOT_BOARD_HANDOFF
       if (CompareMem (Data + Offset + 8, "__DATA_CONST\0\0\0\0", 16) == 0) {
         UINT32  Section;
+        UINT64  SegmentFile = U64 (Data + Offset + 40);
+        UINT64  SegmentFileSize = U64 (Data + Offset + 48);
+        BOOLEAN Found = FALSE;
         for (Section = 0; Section < U32 (Data + Offset + 64); Section++) {
           CONST UINT8  *Header = Data + Offset + 72 + Section * 80;
           UINT64       Value;
-          if ((CompareMem (Header, "__lowglo_base\0\0\0", 16) != 0) || (U64 (Header + 40) != 8) ||
-              (U32 (Header + 48) > Size - 8)) { continue; }
+          UINT64       File;
+          if (CompareMem (Header, "__lowglo_base\0\0\0", 16) != 0) { continue; }
+          // One 8-byte value inside the segment's file range; a second section of the name is refused (first one only).
+          File = U32 (Header + 48);
+          if (Found || (U64 (Header + 40) != 8) || (File < SegmentFile) || (SegmentFileSize < 8) ||
+              (File - SegmentFile > SegmentFileSize - 8) || (File > Size - 8)) {
+            Kernel->StaticVaFloor = DARWIN_XNU_STATIC_VA_FLOOR;
+            break;
+          }
+          Found = TRUE;
           Value = U64 (Data + U32 (Header + 48));
-          // Only a lower, 8 MiB aligned address can relax the limit; anything else keeps the default.
-          if (((Value & (DARWIN_XNU_LOW_GLOBALS_SIZE - 1)) == 0) && (Value + DARWIN_XNU_LOW_GLOBALS_SIZE < DARWIN_XNU_STATIC_VA_FLOOR)) {
+          // Only an 8 MiB aligned kernel address below the stock low globals relaxes the limit (no overflow: the value is
+          // compared against bounds, never summed before the check); anything else keeps the default.
+          if (((Value & (DARWIN_XNU_LOW_GLOBALS_SIZE - 1)) == 0) && (Value >= DARWIN_XNU_MIN_KERNEL_VA) &&
+              (Value < DARWIN_XNU_STATIC_VA_FLOOR - 2 * DARWIN_XNU_LOW_GLOBALS_SIZE)) {
             Kernel->StaticVaFloor = Value + DARWIN_XNU_LOW_GLOBALS_SIZE;
           }
         }
